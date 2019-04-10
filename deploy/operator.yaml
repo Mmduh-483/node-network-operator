@@ -16,22 +16,20 @@ spec:
       serviceAccountName: node-network-operator
       containers:
         - name: node-network-operator
-          # Replace this with the built image name
-          image: quay.io/pliurh/node-network-operator:v0.0.3
+          image: mlnx-operator:latest
+          securityContext:
+            privileged: true
+          volumeMounts:
+          - name: udev
+            mountPath: /etc/udev
+          - name: sys
+            mountPath: /sys
           ports:
           - containerPort: 60000
             name: metrics
           command:
           - node-network-operator
-          imagePullPolicy: Always
-          readinessProbe:
-            exec:
-              command:
-                - stat
-                - /tmp/operator-sdk-ready
-            initialDelaySeconds: 4
-            periodSeconds: 10
-            failureThreshold: 1
+          imagePullPolicy: IfNotPresent 
           env:
             - name: WATCH_NAMESPACE
               value: ""
@@ -41,10 +39,10 @@ spec:
                   fieldPath: metadata.name
             - name: OPERATOR_NAME
               value: "node-network-operator"
-      nodeSelector:
-        node-role.kubernetes.io/master: ""
-      restartPolicy: Always
-      tolerations:
-      - key: "node-role.kubernetes.io/master"
-        operator: "Exists"
-        effect: "NoSchedule"
+      volumes:
+      - name: udev
+        hostPath:
+          path: /etc/udev
+      - name: sys
+        hostPath:
+          path: /sys

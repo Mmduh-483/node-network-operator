@@ -8,5 +8,6 @@ spec:
   priority: 99
   desiredState:
     interfaces: 
-    - name: eth1
-      numVfs: 2
+    - name: enp2s0f0
+      numVfs: 4
+      state: up
