@@ -9,5 +9,6 @@ spec:
   desiredState:
     interfaces: 
     - name: enp2s0f0
+      totalVfs: 10
       numVfs: 4
       state: up

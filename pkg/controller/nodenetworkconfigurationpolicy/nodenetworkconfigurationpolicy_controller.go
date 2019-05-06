@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"regexp"
 
 	k8sv1alpha1 "github.com/pliurh/node-network-operator/pkg/apis/k8s/v1alpha1"
@@ -128,6 +129,14 @@ func (r *ReconcileNodeNetworkConfigurationPolicy) Reconcile(request reconcile.Re
 	}
 	policy := k8sv1alpha1.MergeNodeNetworkConfigurationPolicies(policies)
 	generateIgnConfig(policy)
+
+	// Config interface type, total number of vfs, and enable sriov
+	for _, iface := range instance.Spec.DesiredState.Interfaces {
+                err = configPf(iface)
+		if err != nil {
+			return reconcile.Result{}, err
+		}
+        }
 
 
 	err = r.updateNodeNetworkState(policy)
@@ -289,3 +298,39 @@ func createFileIfNotExist(path string)  {
 		os.Create(path)
 	}
 }
+
+func configPf(iface k8sv1alpha1.Interface) error {
+	log.Info("Configpf", "PF",iface.Name)
+	log.Info("Configpf", "iface", iface)
+        args := make(map[string]string, 0)
+        args["SRIOV_EN"] = "True"
+        args["LINK_TYPE_P1"] = "2"
+        args["NUM_OF_VFS"] = fmt.Sprintf("%d", iface.TotalVfs)
+        pciAddrs, err := getPciAddrsFromNetDevName(iface.Name)
+        if err != nil {
+                return nil
+        }
+	log.Info("Configpf", "PCIADDRS",pciAddrs)
+        for k, v := range args {
+		log.Info("Configpf", k , v)
+                command := fmt.Sprintf("mstconfig -y -d %s set %s=%s", pciAddrs, k, v)
+                cmd := exec.Command("bash", "-c",command)
+                var out bytes.Buffer
+                cmd.Stdout = &out
+                err = cmd.Run()
+                if err != nil {
+                        return err
+                }
+        }
+	return nil
+}
+
+func getPciAddrsFromNetDevName(ifname string) (string, error){
+        link := "/sys/class/net/" + ifname + "/device"
+        pciDevDir, err := os.Readlink(link)
+        if err != nil ||  len(pciDevDir) <= 9 {
+                return "", fmt.Errorf("could not find PCI Address for net dev %s", ifname)
+        }
+        return pciDevDir[9:], nil
+}
+
