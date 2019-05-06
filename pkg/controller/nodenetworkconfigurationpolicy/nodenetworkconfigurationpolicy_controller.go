@@ -4,14 +4,12 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"net/url"
+	"os"
+	"os/exec"
 	"regexp"
 
-	ignv2_2types "github.com/coreos/ignition/config/v2_2/types"
 	k8sv1alpha1 "github.com/pliurh/node-network-operator/pkg/apis/k8s/v1alpha1"
-	mcfgv1 "github.com/openshift/machine-config-operator/pkg/apis/machineconfiguration.openshift.io/v1"
 
-	"github.com/vincent-petithory/dataurl"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -99,7 +97,7 @@ func (r *ReconcileNodeNetworkConfigurationPolicy) Reconcile(request reconcile.Re
 		if errors.IsNotFound(err) {
 			// Request object not found, could have been deleted after reconcile request.
 			// Owned objects are automatically garbage collected. For additional cleanup logic use finalizers.
-			// Return and don't requeue
+			// Return and  don't requeue
 			return reconcile.Result{}, nil
 		}
 		// Error reading the object - requeue the request.
@@ -130,49 +128,16 @@ func (r *ReconcileNodeNetworkConfigurationPolicy) Reconcile(request reconcile.Re
 		return reconcile.Result{}, err
 	}
 	policy := k8sv1alpha1.MergeNodeNetworkConfigurationPolicies(policies)
+	generateIgnConfig(policy)
 
-	// Render MachineConfig based on policies
-	machineConfig, err:= renderMachineConfig(policy)
-	if err != nil {
-		return reconcile.Result{}, err
-	}
-
-	// Check if the MachineConfig already exists.
-	found := &mcfgv1.MachineConfig{}
-	err = r.client.Get(context.TODO(), types.NamespacedName{Name: machineConfig.Name, Namespace: ""}, found)
-	if err != nil && errors.IsNotFound(err) {
-		reqLogger.Info("Creating a new machineConfig", "name", machineConfig.Name)
-		// Create MachineConfig if not exist
-		err = r.client.Create(context.TODO(), machineConfig)
+	// Config interface type, total number of vfs, and enable sriov
+	for _, iface := range instance.Spec.DesiredState.Interfaces {
+                err = configPf(iface)
 		if err != nil {
 			return reconcile.Result{}, err
 		}
-		return reconcile.Result{}, nil
-	} else if err != nil {
-		reqLogger.Info("Error when finding machineConfig ")
-		return reconcile.Result{}, err
-	}
+        }
 
-	// MachineConfig already exists, update it if the hash of spec is different
-	foundHash, err := getMachineConfigHash(&found.Spec)
-	if err != nil {
-		return reconcile.Result{}, err
-	}
-	hash, err := getMachineConfigHash(&machineConfig.Spec)
-	if err != nil {
-		return reconcile.Result{}, err
-	}
-	if foundHash == hash {
-		//No need to update
-		return reconcile.Result{}, nil
-	}
-
-	reqLogger.Info("Update MachineConfig", "name", found.Name)
-	found.Spec.Config = machineConfig.Spec.Config
-	err = r.client.Update(context.TODO(), found)
-	if err != nil {
-		return reconcile.Result{}, err
-	}
 
 	err = r.updateNodeNetworkState(policy)
 	return reconcile.Result{}, nil
@@ -221,7 +186,7 @@ func (r *ReconcileNodeNetworkConfigurationPolicy)updateNodeNetworkState(cr *k8sv
 				return err
 			}
 		}
-		
+
 		// update node network desired config
 		err = r.client.Get(context.TODO(), types.NamespacedName{Name: node.Name, Namespace: ""}, cfg)
 		if err != nil {
@@ -238,37 +203,12 @@ func (r *ReconcileNodeNetworkConfigurationPolicy)updateNodeNetworkState(cr *k8sv
 	return nil
 }
 
-// Render MachineConfig based on policies
-func renderMachineConfig(cr *k8sv1alpha1.NodeNetworkConfigurationPolicy) (*mcfgv1.MachineConfig, error){	
-	config, err := generateIgnConfig(cr)
-	if err != nil {
-		return nil,err
-	}
-
-	return &mcfgv1.MachineConfig{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: cr.Name,
-			Labels: cr.ObjectMeta.Labels,
-		},
-		Spec: mcfgv1.MachineConfigSpec{
-			Config: *config,
-		},
-	}, nil
-}
-
-func generateIgnConfig(cr *k8sv1alpha1.NodeNetworkConfigurationPolicy) (*ignv2_2types.Config, error) {
+func generateIgnConfig(cr *k8sv1alpha1.NodeNetworkConfigurationPolicy) {
 	contents := make(map[string]string)
 	for _, iface := range cr.Spec.DesiredState.Interfaces {
 		parseInterface(iface, contents)
 	}
-
-	config := ignv2_2types.Config{
-		Storage: ignv2_2types.Storage{
-			Files: generateFiles(contents),
-		},
-	}
-
-	return &config, nil
+	generateFiles(contents)
 }
 
 func parseInterface(i k8sv1alpha1.Interface, contents map[string]string) {
@@ -276,8 +216,23 @@ func parseInterface(i k8sv1alpha1.Interface, contents map[string]string) {
 		contents["mtu"] += fmt.Sprintf("ACTION==\"add\", SUBSYSTEM==\"net\", KERNEL==\"%s\", RUN+=\"/sbin/ip link set mtu %d dev '%%k'\"\n", i.Name, *i.Mtu)
 	}
 	if i.NumVfs != nil && *i.NumVfs >= 0 {
-		contents["sriov"] += fmt.Sprintf("ACTION==\"add\", SUBSYSTEM==\"net\", KERNEL==\"%s\", ATTR{device/sriov_numvfs}=\"%d\"\n", i.Name, *i.NumVfs)
-	}
+		link := fmt.Sprintf("/sys/class/net/%s/device", i.Name)
+		pciDevDir, err  := os.Readlink(link)
+		if err != nil {
+			log.Error(err, "failed to get pci bus")
+		} else {
+			contents["sriov"] += fmt.Sprintf("ACTION==\"add\", SUBSYSTEM==\"pci\", KERNEL==\"%s\", ATTR{sriov_numvfs}=\"%d\"\n", pciDevDir[9:], *i.NumVfs)
+		}
+		numvfsFilePath := fmt.Sprintf("/sys/class/net/%s/device/sriov_numvfs", i.Name)
+		log.Info("file path", "path to numvfs", numvfsFilePath)
+		if f,err := os.OpenFile(numvfsFilePath, os.O_WRONLY, 0644); err == nil {
+			_,err := f.Write(([]byte)("0"))
+			log.Info("err msg", "err:",err)
+			f.Close()
+			f, _ := os.OpenFile(numvfsFilePath, os.O_WRONLY, 0644)
+			f.Write(([]byte)(fmt.Sprintf("%d", *i.NumVfs)))
+			f.Close()
+	}}
 	if i.Promisc != nil {
 		filename := "ifcfg-" + i.Name
 		contents[filename] += fmt.Sprintf("DEVICE=%s\n", i.Name)
@@ -291,63 +246,91 @@ func parseInterface(i k8sv1alpha1.Interface, contents map[string]string) {
 	}
 }
 
-func getEncodedContent(inp string) string {
-	return (&url.URL{
-		Scheme: "data",
-		Opaque: "," + dataurl.Escape([]byte(inp)),
-	}).String()
-}
-
-func generateFiles(contents map[string]string) []ignv2_2types.File {
-	var files []ignv2_2types.File
-	fileMode := int(420)
+func generateFiles(contents map[string]string) {
+	mtuFileName,sriovFileName:="/etc/udev/rules.d/99-mtu.rules","/etc/udev/rules.d/99-sriov.rules"
+	createFileIfNotExist(mtuFileName)
+	createFileIfNotExist(sriovFileName)
+	mtuFile, err := os.OpenFile(mtuFileName, os.O_WRONLY, 0644)
+	if err != nil {
+		log.Error(err, "failed to open 99-mtu.rules")
+	}
+	defer mtuFile.Close()
+	sriovFile, err := os.OpenFile(sriovFileName, os.O_WRONLY, 0644)
+	if err != nil {
+		log.Error(err, "failed to open 99-sriov.rules")
+	}
+	defer sriovFile.Close()
 	r := regexp.MustCompile(`^ifcfg-.*`)
 
 	for k, v := range contents {
 		switch k {
 		case "mtu":
 			log.Info("file content", "99-mtu.rules", v)
-			files = append (files, ignv2_2types.File{
-				Node: ignv2_2types.Node{
-					Path: "/etc/udev/rules.d/99-mtu.rules",
-				},
-				FileEmbedded1: ignv2_2types.FileEmbedded1{
-					Contents: ignv2_2types.FileContents{
-						Source: getEncodedContent(v),
-					},
-					Mode: &fileMode,
-				},
-			})
+			_, err = mtuFile.Write(([]byte)(v))
+			if err != nil{
+				log.Error(err, "Failed to write to mtu file")
+			}
 		case "sriov":
 			log.Info("file content", "99-sriov.rules", v)
-			files = append (files, ignv2_2types.File{
-				Node: ignv2_2types.Node{
-					Path: "/etc/udev/rules.d/99-sriov.rules",
-				},
-				FileEmbedded1: ignv2_2types.FileEmbedded1{
-					Contents: ignv2_2types.FileContents{
-						Source: getEncodedContent(v),
-					},
-					Mode: &fileMode,
-				},
-			})
+			_, err = sriovFile.Write(([]byte)(v))
+			if err != nil{
+                                log.Error(err, "Failed to write to sriov file")
+                        }
 		default:
 			if r.MatchString(k) {
 				log.Info("file content", k, v)
-				files = append (files, ignv2_2types.File{
-					Node: ignv2_2types.Node{
-						Path: fmt.Sprintf("/etc/sysconfig/network-scripts/%s", k),
-					},
-					FileEmbedded1: ignv2_2types.FileEmbedded1{
-						Contents: ignv2_2types.FileContents{
-							Source: getEncodedContent(v),
-						},
-						Mode: &fileMode,
-					},
-				})
+				path:= fmt.Sprintf("/etc/sysconfig/network-scripts/%s", k)
+				createFileIfNotExist(path)
+				f, err := os.OpenFile(path, os.O_WRONLY, 0644)
+				if err != nil{
+					log.Error(err, "failed to open ifcfg-file rules")
+				}
+				defer f.Close()
+				f.Write(([]byte)(v))
 			}
 		}
 	}
-
-	return files
 }
+
+func createFileIfNotExist(path string)  {
+	_, err := os.Stat(path)
+	if err != nil {
+		os.Create(path)
+	}
+}
+
+func configPf(iface k8sv1alpha1.Interface) error {
+	log.Info("Configpf", "PF",iface.Name)
+	log.Info("Configpf", "iface", iface)
+        args := make(map[string]string, 0)
+        args["SRIOV_EN"] = "True"
+        args["LINK_TYPE_P1"] = "2"
+        args["NUM_OF_VFS"] = fmt.Sprintf("%d", iface.TotalVfs)
+        pciAddrs, err := getPciAddrsFromNetDevName(iface.Name)
+        if err != nil {
+                return nil
+        }
+	log.Info("Configpf", "PCIADDRS",pciAddrs)
+        for k, v := range args {
+		log.Info("Configpf", k , v)
+                command := fmt.Sprintf("mstconfig -y -d %s set %s=%s", pciAddrs, k, v)
+                cmd := exec.Command("bash", "-c",command)
+                var out bytes.Buffer
+                cmd.Stdout = &out
+                err = cmd.Run()
+                if err != nil {
+                        return err
+                }
+        }
+	return nil
+}
+
+func getPciAddrsFromNetDevName(ifname string) (string, error){
+        link := "/sys/class/net/" + ifname + "/device"
+        pciDevDir, err := os.Readlink(link)
+        if err != nil ||  len(pciDevDir) <= 9 {
+                return "", fmt.Errorf("could not find PCI Address for net dev %s", ifname)
+        }
+        return pciDevDir[9:], nil
+}
+

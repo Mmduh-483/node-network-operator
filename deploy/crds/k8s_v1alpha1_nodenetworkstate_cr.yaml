@@ -1,7 +1,15 @@
 apiVersion: k8s.cni.cncf.io/v1alpha1
 kind: NodeNetworkState
 metadata:
-  name: minikube
+  name: 127.0.0.1 
 spec:
   managed: true
-  
+status:
+ desiredState:
+ interfaces:
+ - name: enp2s0f0
+ numVfs: 1
+ operationalState:
+ interfaces:
+ - name: enp2s0f0
+ numVfs: 2  
